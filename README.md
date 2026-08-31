@@ -10,8 +10,9 @@ firmware (aka ROMs) onto Samsung mobile devices.
 ## Supported Platforms
 
 Heimdall should work on most Linux systems, and perhaps even on OSX
-and Windows, though the latter two are not tested by the current
-maintainer.
+and Windows. The latter two are not tested by the current maintainer,
+but users have reported success on OSX through macports:
+https://github.com/macports/macports-ports/blob/master/comms/Heimdall/Portfile
 
 ## How does Heimdall work?
 
