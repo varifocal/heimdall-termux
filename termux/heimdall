@@ -12,6 +12,20 @@ if [ ! -x "$REAL" ]; then
 	fi
 fi
 
+# Commands that do not use USB.
+case "${1:-}" in
+	"" | version | help | --help | -h)
+		exec "$REAL" "$@"
+		;;
+	print-pit)
+		for arg in "$@"; do
+			if [ "$arg" = "--file" ]; then
+				exec "$REAL" "$@"
+			fi
+		done
+		;;
+esac
+
 # Stage 2: termux-usb passed the permitted device file descriptor as $1.
 if [ "${HD_STAGE:-}" = "1" ] && [ $# -eq 1 ]; then
 	case "$1" in
