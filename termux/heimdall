@@ -1,0 +1,73 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -eu
+
+REAL="${PREFIX:-}/libexec/heimdall-real"
+if [ ! -x "$REAL" ]; then
+	here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+	if [ -x "$here/../build/bin/heimdall" ]; then
+		REAL="$here/../build/bin/heimdall"
+	else
+		echo "heimdall: heimdall-real not found; run install.sh first" >&2
+		exit 1
+	fi
+fi
+
+# Stage 2: termux-usb passed the permitted device file descriptor as $1.
+if [ "${HD_STAGE:-}" = "1" ] && [ $# -eq 1 ]; then
+	case "$1" in
+		"" | *[!0-9]*)
+			echo "heimdall: invalid file descriptor '$1'" >&2
+			exit 1
+			;;
+	esac
+	export USB_FD="$1"
+	eval "set -- ${HD_ARGS:-}"
+	rc=0
+	"$REAL" "$@" || rc=$?
+	if [ -n "${HD_RC_FILE:-}" ]; then
+		printf '%s\n' "$rc" > "$HD_RC_FILE"
+	fi
+	exit "$rc"
+fi
+
+# Stage 1: pick a device and let termux-usb open it with permission.
+if ! command -v termux-usb >/dev/null 2>&1; then
+	echo "heimdall: termux-usb not found; install the termux-api package and the Termux:API app" >&2
+	exit 1
+fi
+
+device=${HD_DEV:-}
+if [ -z "$device" ]; then
+	listing=$(termux-usb -l)
+	case "$listing" in
+		"["*) ;;
+		*)
+			echo "$listing" >&2
+			echo "heimdall: termux-usb -l did not return a device list" >&2
+			exit 1
+			;;
+	esac
+	count=$(printf '%s' "$listing" | jq length)
+	if [ "$count" -eq 0 ]; then
+		echo "heimdall: no USB devices found; plug in a device in download mode" >&2
+		exit 1
+	fi
+	device=$(printf '%s' "$listing" | jq -r '.[0]')
+	if [ "$count" -gt 1 ]; then
+		echo "heimdall: several devices found, using $device; set HD_DEV to pick another" >&2
+	fi
+fi
+
+printf -v HD_ARGS '%q ' "$@"
+HD_RC_FILE=$(mktemp)
+export HD_ARGS HD_RC_FILE HD_STAGE=1
+
+rc=0
+termux-usb -r -e "$(readlink -f "$0")" "$device" || rc=$?
+if [ -f "$HD_RC_FILE" ]; then
+	rc=$(cat "$HD_RC_FILE")
+elif [ "$rc" -eq 0 ]; then
+	rc=1
+fi
+rm -f "$HD_RC_FILE"
+exit "$rc"
