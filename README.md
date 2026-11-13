@@ -12,8 +12,10 @@ termux-usb opens with permission.
 
 ## Requirements
 
-- Termux from F-Droid or the GitHub builds
-- The Termux:API app, installed alongside the termux-api package
+- [Termux](https://f-droid.org/packages/com.termux/) from F-Droid or the
+  GitHub builds
+- The [Termux:API](https://f-droid.org/packages/com.termux.api/) app from
+  F-Droid, installed alongside the termux-api package
 - An aarch64 device
 - A USB-C OTG cable (or a USB-A OTG adapter plus cable)
 - The Samsung device in download mode
