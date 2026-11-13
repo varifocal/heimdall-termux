@@ -1,63 +1,107 @@
-# Heimdall
+# heimdall-termux
 
-[![builds.sr.ht status](https://builds.sr.ht/~grimler/Heimdall/commits/ubuntu.yml.svg)](https://builds.sr.ht/~grimler/Heimdall/commits/ubuntu.yml?)
-[![builds.sr.ht status](https://builds.sr.ht/~grimler/Heimdall/commits/archlinux.yml.svg)](https://builds.sr.ht/~grimler/Heimdall/commits/archlinux.yml?)
-[![builds.sr.ht status](https://builds.sr.ht/~grimler/Heimdall/commits/alpine.yml.svg)](https://builds.sr.ht/~grimler/Heimdall/commits/alpine.yml?)
+Heimdall 2.2.2 patched to run in Termux on non-rooted Android, using termux-usb.
 
-Heimdall is a cross-platform open-source tool suite used to flash
-firmware (aka ROMs) onto Samsung mobile devices.
+## Why
 
-## Supported Platforms
+Heimdall lists USB devices through libusb enumeration. Stock Android
+does not let normal apps read /dev/bus/usb, so enumeration returns
+nothing and every action fails in Termux without root. This fork skips
+enumeration and talks to the device through a file descriptor that
+termux-usb opens with permission.
 
-Heimdall should work on most Linux systems, and perhaps even on OSX
-and Windows. The latter two are not tested by the current maintainer,
-but users have reported success on OSX through macports:
-https://github.com/macports/macports-ports/blob/master/comms/Heimdall/Portfile
+## Requirements
 
-## How does Heimdall work?
+- Termux from F-Droid or the GitHub builds
+- The Termux:API app, installed alongside the termux-api package
+- An aarch64 device
+- A USB-C OTG cable (or a USB-A OTG adapter plus cable)
+- The Samsung device in download mode
 
-Heimdall connects to a mobile device over USB and interacts with
-low-level software running on the device, known as Loke. Loke and
-Heimdall communicate via the custom Samsung-developed protocol
-typically referred to as the 'Odin 3 protocol'.
+## Install
 
-USB communication in Heimdall is handled by the popular open-source
-USB library, [libusb](https://libusb.info).
-
-## Free & Open Source
-
-Heimdall is both free and open source. It is licensed under the MIT
-license (see LICENSE).
-
-Heimdall has been developed through countless hours of reverse
-engineering work, predominantly by [Glass
-Echidna](https://glassechidna.com.au/), a _tiny_ independent software
-development company.
-
-## Documentation
-
-To compile Heimdall and Heimdall-frontend (the gui application), run
-something like:
+Download the release files, verify the checksum, run the installer:
 
 ```sh
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make
+curl -LO https://github.com/varifocal/heimdall-termux/releases/download/v2.2.2-termux1/heimdall-termux-aarch64.tar.gz
+curl -LO https://github.com/varifocal/heimdall-termux/releases/download/v2.2.2-termux1/SHA256SUMS
+curl -LO https://github.com/varifocal/heimdall-termux/releases/download/v2.2.2-termux1/install.sh
+sha256sum -c SHA256SUMS
+bash install.sh
 ```
 
-To only compile the CLI tool, add the option -DDISABLE_FRONTEND=true
-to the cmake command.
+## Usage
 
-The name of dependencies vary between distributions. On alpinelinux
-you need to install: `make cmake gcc g++ libc-dev qt6-qtbase-dev and
-libusb-dev`, on archlinux: `cmake libusb qt6-base` and on ubuntu: `cmake
-g++ pkg-config libusb-1.0.0-dev qt6-base-dev and zlib1g-dev`.
+Put the phone in download mode, connect the cable, then:
 
-Some more documentation, and instructions on how to use Heimdall and
-Heimdall-frontend, can be found in the doc/ folder.
+```sh
+heimdall detect
+heimdall print-pit
+heimdall flash --RECOVERY recovery.img --no-reboot
+```
 
-### Odin protocol and PIT format
+If several devices are attached, the first one listed by termux-usb is
+used. Set HD_DEV to choose another:
 
-For more details on the Odin protocol, and the PIT files, see the
-external project [samsung-loki/samsung-docs](https://samsung-loki.github.io/samsung-docs/).
+```sh
+HD_DEV=/dev/bus/usb/001/003 heimdall detect
+```
+
+## How it works
+
+termux-usb asks Android for permission and runs the wrapper with an open
+file descriptor for the device. The wrapper stores that descriptor in
+the USB_FD environment variable and runs the patched heimdall binary.
+BridgeManager reads USB_FD and wraps the descriptor with
+libusb_wrap_sys_device() instead of calling libusb_get_device_list(),
+then keeps the usual descriptor parsing and interface claiming. libusb
+is initialised with LIBUSB_OPTION_NO_DEVICE_DISCOVERY, so no bus scan
+happens. The patch lives in
+[heimdall/source/BridgeManager.cpp](heimdall/source/BridgeManager.cpp)
+and [heimdall/source/BridgeManager.h](heimdall/source/BridgeManager.h).
+
+## Tested
+
+Detect and print-pit confirmed on Samsung SM-A127F (Exynos 850) from a
+tablet running Termux. Flashing is not tested.
+
+## Limitations
+
+- Termux on aarch64 only.
+- The binary links against Termux's libusb and libc++ dynamically.
+- The first listed device is used unless HD_DEV is set.
+- `--wait` does nothing useful with the wrapper; the descriptor comes
+  from termux-usb, which does not watch for replugs.
+- Large images such as super may be slow or unreliable.
+- One session per call. Use `--no-reboot`, then `--resume` for the next
+  call.
+
+## Building from source
+
+```sh
+git clone https://github.com/varifocal/heimdall-termux.git
+cd heimdall-termux
+bash termux/build.sh
+```
+
+build.sh installs the build dependencies, configures cmake with
+`-DDISABLE_FRONTEND=ON`, and runs make. The binary ends up in
+`build/bin/heimdall`.
+
+## Credits
+
+- Heimdall by [Benjamin Dobell (Glass Echidna)](https://glassechidna.com.au/).
+- Maintained fork by [Henrik Grimler](https://git.sr.ht/~grimler/Heimdall).
+- [termux-usb and Termux:API](https://github.com/termux/termux-api) provide
+  the USB access.
+- Termux patch and wrapper by [varifocal](https://github.com/varifocal).
+
+## License
+
+MIT, same as upstream. See [LICENSE](LICENSE).
+
+## Disclaimer
+
+Flashing can brick a device. Use it at your own risk. Back up your PIT
+before flashing, and never flash BOOTLOADER, EFS or KEYSTORAGE without a
+verified backup.
