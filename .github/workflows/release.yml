@@ -120,17 +120,17 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm --platform linux/arm64 \
-            -e STRIP_ON="$STRIP_ON" \
             -v "$PWD":/work -w /work \
             termux/termux-docker:aarch64 \
             bash -c '
               set -euo pipefail
+              strip_on="${1:-false}"
               export PREFIX=/data/data/com.termux/files/usr
               export HOME=/data/data/com.termux/files/home
               export PATH="$PREFIX/bin:$PATH"
               pkg update -y || { sleep 5; pkg update -y; }
               bash termux/build.sh
-              if [ "$STRIP_ON" = "true" ]; then
+              if [ "$strip_on" = "true" ]; then
                 strip --strip-all build/bin/heimdall
               fi
               cp build/bin/heimdall dist/heimdall-real
@@ -143,7 +143,7 @@ jobs:
               echo "== Smoke test =="
               ./dist/heimdall-real version
               chmod a+rX dist/heimdall dist/heimdall-real dist/heimdall-termux-aarch64.tar.gz dist/SHA256SUMS dist/install.sh
-            '
+            ' termux-ci "$STRIP_ON"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
