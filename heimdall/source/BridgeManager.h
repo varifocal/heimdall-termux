@@ -134,6 +134,9 @@ namespace Heimdall
 
 			UsbLogLevel usbLogLevel;
 
+			bool InitialiseLibusbContext(void);
+			int OpenDeviceFromUsbFd(void);
+
 			int FindDeviceInterface(void);
 			bool ClaimDeviceInterface(void);
 			bool SetupDeviceInterface(void);

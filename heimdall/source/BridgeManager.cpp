@@ -19,8 +19,13 @@
  THE SOFTWARE.*/
 
 // C Standard Library
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+
+// POSIX
+#include <unistd.h>
 
 // libusb
 #include <libusb.h>
@@ -83,56 +88,25 @@ int BridgeManager::FindDeviceInterface(void)
 	else
 		Interface::Print("Detecting device...\n");
 
-	struct libusb_device **devices;
-	unsigned int deviceCount, deviceIndex, i;
-	libusb_device_descriptor descriptor;
-	while (true)
+	// Android blocks /dev/bus/usb enumeration for normal (non-rooted) apps, so
+	// instead of scanning for a supported device we wrap the USB file
+	// descriptor that termux-usb handed to us (via the USB_FD environment
+	// variable) with libusb_wrap_sys_device().
+	int result = OpenDeviceFromUsbFd();
+
+	if (result != BridgeManager::kInitialiseSucceeded)
 	{
-		deviceCount = libusb_get_device_list(libusbContext, &devices);
+		if (result == BridgeManager::kInitialiseDeviceNotDetected)
+			Interface::PrintDeviceDetectionFailed();
 
-		for (deviceIndex = 0; deviceIndex < deviceCount; deviceIndex++)
-		{
-			libusb_get_device_descriptor(devices[deviceIndex], &descriptor);
-
-			for (i = 0; i < BridgeManager::kSupportedDeviceCount; i++)
-			{
-				if (descriptor.idVendor == supportedDevices[i].vendorId &&
-				    descriptor.idProduct == supportedDevices[i].productId)
-				{
-					heimdallDevice = devices[deviceIndex];
-					libusb_ref_device(heimdallDevice);
-					break;
-				}
-			}
-		}
-		if (heimdallDevice)
-			break;
-
-		libusb_free_device_list(devices, deviceCount);
-		if (waitForDevice)
-			Sleep(1000);
-		else
-			break;
-	}
-
-	if (!heimdallDevice)
-	{
-		Interface::PrintDeviceDetectionFailed();
-		return (BridgeManager::kInitialiseDeviceNotDetected);
-	}
-
-	int result = libusb_open(heimdallDevice, &deviceHandle);
-	if (result != LIBUSB_SUCCESS)
-	{
-		Interface::PrintError("Failed to access device. libusb error: %d\n", result);
-		return (BridgeManager::kInitialiseFailed);
+		return (result);
 	}
 
 	libusb_device_descriptor deviceDescriptor;
 	result = libusb_get_device_descriptor(heimdallDevice, &deviceDescriptor);
 	if (result != LIBUSB_SUCCESS)
 	{
-		Interface::PrintError("Failed to retrieve device description\n");
+		Interface::PrintError("Failed to retrieve device description: %s\n", libusb_error_name(result));
 		return (BridgeManager::kInitialiseFailed);
 	}
 
@@ -173,7 +147,11 @@ int BridgeManager::FindDeviceInterface(void)
 
 	if (result != LIBUSB_SUCCESS || !configDescriptor)
 	{
-		Interface::PrintError("Failed to retrieve config descriptor\n");
+		if (result != LIBUSB_SUCCESS)
+			Interface::PrintError("Failed to retrieve config descriptor: %s\n", libusb_error_name(result));
+		else
+			Interface::PrintError("Failed to retrieve config descriptor\n");
+
 		return (BridgeManager::kInitialiseFailed);
 	}
 
@@ -249,9 +227,21 @@ bool BridgeManager::ClaimDeviceInterface(void)
 
 	if (result != LIBUSB_SUCCESS)
 	{
-		detachedDriver = true;
-		Interface::Print("Attempt failed. Detaching driver...\n");
-		libusb_detach_kernel_driver(deviceHandle, interfaceIndex);
+		Interface::Print("Attempt failed (%s). Detaching driver...\n", libusb_error_name(result));
+
+		int detachResult = libusb_detach_kernel_driver(deviceHandle, interfaceIndex);
+
+		// On Android there is normally no kernel driver bound to the
+		// interface, so NOT_FOUND/NOT_SUPPORTED are not fatal.
+		if (detachResult == LIBUSB_SUCCESS)
+		{
+			detachedDriver = true;
+		}
+		else if (detachResult != LIBUSB_ERROR_NOT_SUPPORTED && detachResult != LIBUSB_ERROR_NOT_FOUND)
+		{
+			Interface::PrintWarning("Failed to detach kernel driver: %s\n", libusb_error_name(detachResult));
+		}
+
 		Interface::Print("Claiming interface again...\n");
 		result = libusb_claim_interface(deviceHandle, interfaceIndex);
 	}
@@ -260,7 +250,7 @@ bool BridgeManager::ClaimDeviceInterface(void)
 
 	if (result != LIBUSB_SUCCESS)
 	{
-		Interface::PrintError("Claiming interface failed!\n");
+		Interface::PrintError("Claiming interface failed: %s\n", libusb_error_name(result));
 		return (false);
 	}
 
@@ -284,7 +274,7 @@ bool BridgeManager::SetupDeviceInterface(void)
 
 	if (result != LIBUSB_SUCCESS)
 	{
-		Interface::PrintError("Setting up interface failed!\n");
+		Interface::PrintError("Setting up interface failed: %s\n", libusb_error_name(result));
 		return (false);
 	}
 
@@ -296,14 +286,26 @@ void BridgeManager::ReleaseDeviceInterface(void)
 {
 	Interface::Print("Releasing device interface...\n");
 
-	libusb_release_interface(deviceHandle, interfaceIndex);
+	int result = libusb_release_interface(deviceHandle, interfaceIndex);
+
+	if (result != LIBUSB_SUCCESS && result != LIBUSB_ERROR_NOT_FOUND &&
+	    result != LIBUSB_ERROR_NO_DEVICE)
+	{
+		Interface::PrintWarning("Failed to release interface: %s\n", libusb_error_name(result));
+	}
 
 #ifdef OS_LINUX
 
 	if (detachedDriver)
 	{
 		Interface::Print("Re-attaching kernel driver...\n");
-		libusb_attach_kernel_driver(deviceHandle, interfaceIndex);
+		int attachResult = libusb_attach_kernel_driver(deviceHandle, interfaceIndex);
+
+		if (attachResult != LIBUSB_SUCCESS && attachResult != LIBUSB_ERROR_NOT_SUPPORTED &&
+		    attachResult != LIBUSB_ERROR_NOT_FOUND)
+		{
+			Interface::PrintWarning("Failed to re-attach kernel driver: %s\n", libusb_error_name(attachResult));
+		}
 	}
 
 #endif
@@ -326,9 +328,11 @@ bool BridgeManager::InitialiseProtocol(void)
 	if (IsUbuntu())
 	{
 		Interface::Print("Resetting device...\n");
-		if (libusb_reset_device(deviceHandle))
+		int resetResult = libusb_reset_device(deviceHandle);
+
+		if (resetResult != LIBUSB_SUCCESS)
 		{
-			Interface::PrintError("Failed to reset device!\n");
+			Interface::PrintError("Failed to reset device: %s\n", libusb_error_name(resetResult));
 		}
 	}
 #endif
@@ -347,8 +351,7 @@ bool BridgeManager::InitialiseProtocol(void)
 
 	if (result != LIBUSB_SUCCESS)
 	{
-		if (verbose)
-			Interface::PrintError("Failed to receive handshake response. Result: %d\n", result);
+		Interface::PrintError("Failed to receive handshake response: %s\n", libusb_error_name(result));
 	}
 	else
 	{
@@ -415,78 +418,168 @@ BridgeManager::~BridgeManager()
 		libusb_exit(libusbContext);
 }
 
-bool BridgeManager::DetectDevice(void)
+bool BridgeManager::InitialiseLibusbContext(void)
 {
-	// Initialise libusb
+	// Skip libusb's device discovery. On non-rooted Android, normal apps
+	// cannot enumerate /dev/bus/usb (libusb_get_device_list() returns nothing
+	// or fails), so we work exclusively with a pre-permitted file descriptor
+	// obtained from termux-usb and wrap it with libusb_wrap_sys_device().
+	//
+	// LIBUSB_OPTION_WEAK_AUTHORITY is a macro alias of
+	// LIBUSB_OPTION_NO_DEVICE_DISCOVERY in libusb >= 1.0.27 headers; older
+	// headers only have the enum value LIBUSB_OPTION_WEAK_AUTHORITY.
+#ifdef LIBUSB_OPTION_WEAK_AUTHORITY
+	int optionResult = libusb_set_option(nullptr, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+#else
+	int optionResult = libusb_set_option(nullptr, LIBUSB_OPTION_WEAK_AUTHORITY);
+#endif
+
+	if (optionResult != LIBUSB_SUCCESS)
+	{
+		Interface::PrintWarning("Failed to disable libusb device discovery: %s\n",
+			libusb_error_name(optionResult));
+	}
+
 	int result = libusb_init(&libusbContext);
 
 	if (result != LIBUSB_SUCCESS)
 	{
-		Interface::PrintError("Failed to initialise libusb. libusb error: %d\n", result);
+		Interface::PrintError("Failed to initialise libusb: %s\n", libusb_error_name(result));
 		return (false);
 	}
-
-	if (waitForDevice)
-		Interface::Print("Waiting for device...\n");
 
 	// Set libusb log level.
 	SetUsbLogLevel(usbLogLevel);
 
-	struct libusb_device **devices;
-	unsigned int deviceCount, deviceIndex, i;
-	libusb_device_descriptor descriptor;
-	while (true)
+	return (true);
+}
+
+int BridgeManager::OpenDeviceFromUsbFd(void)
+{
+	const char *usbFdString = getenv("USB_FD");
+
+	if (usbFdString == nullptr || usbFdString[0] == '\0')
 	{
-		deviceCount = libusb_get_device_list(libusbContext, &devices);
-
-		for (deviceIndex = 0; deviceIndex < deviceCount; deviceIndex++)
-		{
-			libusb_get_device_descriptor(devices[deviceIndex], &descriptor);
-
-			for (i = 0; i < BridgeManager::kSupportedDeviceCount; i++)
-			{
-				if (descriptor.idVendor == supportedDevices[i].vendorId &&
-				    descriptor.idProduct == supportedDevices[i].productId)
-				{
-					libusb_free_device_list(devices, deviceCount);
-
-					Interface::Print("Device detected\n");
-					return (true);
-				}
-			}
-		}
-
-		libusb_free_device_list(devices, deviceCount);
-		if (waitForDevice)
-			Sleep(1000);
-		else
-			break;
+		Interface::PrintError("USB_FD environment variable is not set.\n"
+			"On Android heimdall must be run through termux-usb so that it receives\n"
+			"an already-permitted USB file descriptor, e.g.\n"
+			"  HARGS=\"detect\" termux-usb -e ~/hd.sh /dev/bus/usb/001/003\n");
+		return (BridgeManager::kInitialiseFailed);
 	}
-	Interface::PrintDeviceDetectionFailed();
-	return (false);
+
+	char *parseEnd = nullptr;
+	long fd = strtol(usbFdString, &parseEnd, 10);
+
+	if (parseEnd == usbFdString || *parseEnd != '\0' || fd < 0 || fd > INT_MAX)
+	{
+		Interface::PrintError("USB_FD does not contain a valid file descriptor: \"%s\"\n", usbFdString);
+		return (BridgeManager::kInitialiseFailed);
+	}
+
+	// Show what the descriptor points to (helps verify the correct device
+	// node was passed after a replug).
+	char fdPath[64];
+	snprintf(fdPath, sizeof(fdPath), "/proc/self/fd/%ld", fd);
+
+	char fdTarget[256];
+	ssize_t targetLength = readlink(fdPath, fdTarget, sizeof(fdTarget) - 1);
+
+	if (targetLength >= 0)
+	{
+		fdTarget[targetLength] = '\0';
+		Interface::Print("Using USB file descriptor %ld (%s)\n", fd, fdTarget);
+	}
+	else
+	{
+		Interface::Print("Using USB file descriptor %ld\n", fd);
+	}
+
+	int result = libusb_wrap_sys_device(libusbContext, static_cast<intptr_t>(fd), &deviceHandle);
+
+	if (result != LIBUSB_SUCCESS)
+	{
+		Interface::PrintError("Failed to wrap USB file descriptor %ld: %s\n", fd, libusb_error_name(result));
+
+		if (targetLength >= 0)
+			Interface::Print("  fd %ld -> %s\n", fd, fdTarget);
+
+		return (BridgeManager::kInitialiseFailed);
+	}
+
+	heimdallDevice = libusb_get_device(deviceHandle);
+
+	if (!heimdallDevice)
+	{
+		Interface::PrintError("libusb_wrap_sys_device returned a handle without a device.\n");
+		return (BridgeManager::kInitialiseFailed);
+	}
+
+	// The wrapped device is owned by the handle (and destroyed by
+	// libusb_close()), so take our own reference to balance the
+	// libusb_unref_device() performed in the destructor.
+	libusb_ref_device(heimdallDevice);
+
+	libusb_device_descriptor descriptor;
+	result = libusb_get_device_descriptor(heimdallDevice, &descriptor);
+
+	if (result != LIBUSB_SUCCESS)
+	{
+		Interface::PrintError("Failed to retrieve device descriptor: %s\n", libusb_error_name(result));
+		return (BridgeManager::kInitialiseFailed);
+	}
+
+	if (descriptor.idVendor != BridgeManager::kVidSamsung)
+	{
+		Interface::PrintError("Device %04X:%04X is not a Samsung device (expected VID %04X).\n",
+			descriptor.idVendor, descriptor.idProduct, BridgeManager::kVidSamsung);
+		return (BridgeManager::kInitialiseDeviceNotDetected);
+	}
+
+	return (BridgeManager::kInitialiseSucceeded);
+}
+
+bool BridgeManager::DetectDevice(void)
+{
+	// Initialise libusb (without device discovery; see above).
+	if (!InitialiseLibusbContext())
+		return (false);
+
+	if (waitForDevice)
+		Interface::Print("Waiting for device...\n");
+
+	// Wrap the file descriptor provided by termux-usb rather than scanning
+	// the USB bus (enumeration is unavailable to normal Android apps).
+	int result = OpenDeviceFromUsbFd();
+
+	if (result != BridgeManager::kInitialiseSucceeded)
+	{
+		if (result == BridgeManager::kInitialiseDeviceNotDetected)
+			Interface::PrintDeviceDetectionFailed();
+
+		return (false);
+	}
+
+	Interface::Print("Device detected\n");
+	return (true);
 }
 
 int BridgeManager::Initialise(bool resume)
 {
 	Interface::Print("Initialising connection...\n");
 
-	// Initialise libusb
-	int result = libusb_init(&libusbContext);
-
-	if (result != LIBUSB_SUCCESS)
+	// Initialise libusb (without device discovery; see above).
+	if (!InitialiseLibusbContext())
 	{
-		Interface::PrintError("Failed to initialise libusb. libusb error: %d\n", result);
 		Interface::Print("Failed to connect to device!\n");
 		return (BridgeManager::kInitialiseFailed);
 	}
 
+#ifdef _WIN32
 	// Fixes LIBUSB_ERROR_NOT_FOUND when using dg_ssudbus driver instead of WinUSB.
 	libusb_set_option(libusbContext, LIBUSB_OPTION_USE_USBDK);
+#endif
 
-	// Setup libusb log level.
-	SetUsbLogLevel(usbLogLevel);
-
-	result = FindDeviceInterface();
+	int result = FindDeviceInterface();
 
 	if (result != BridgeManager::kInitialiseSucceeded)
 		return (result);
@@ -623,7 +716,7 @@ bool BridgeManager::SendBulkTransfer(unsigned char *data, int length, int timeou
 		static const int retryDelay = 250;
 
 		if (verbose)
-			Interface::PrintError("libusb error %d whilst sending bulk transfer.", result);
+			Interface::PrintError("libusb error %s whilst sending bulk transfer.", libusb_error_name(result));
 
 		// Retry
 		for (int i = 0; i < 5; i++)
@@ -640,7 +733,7 @@ bool BridgeManager::SendBulkTransfer(unsigned char *data, int length, int timeou
 				break;
 
 			if (verbose)
-				Interface::PrintError("libusb error %d whilst sending bulk transfer.", result);
+				Interface::PrintError("libusb error %s whilst sending bulk transfer.", libusb_error_name(result));
 		}
 
 		if (verbose)
@@ -668,7 +761,7 @@ int BridgeManager::ReceiveBulkTransfer(unsigned char *data, int length, int time
 		static const int retryDelay = 250;
 
 		if (verbose)
-			Interface::PrintError("libusb error %d whilst receiving bulk transfer.", result);
+			Interface::PrintError("libusb error %s whilst receiving bulk transfer.", libusb_error_name(result));
 
 		// Retry
 		for (int i = 0; i < 5; i++)
@@ -685,7 +778,7 @@ int BridgeManager::ReceiveBulkTransfer(unsigned char *data, int length, int time
 				break;
 
 			if (verbose)
-				Interface::PrintError("libusb error %d whilst receiving bulk transfer.", result);
+				Interface::PrintError("libusb error %s whilst receiving bulk transfer.", libusb_error_name(result));
 		}
 
 		if (verbose)
