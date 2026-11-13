@@ -1,0 +1,194 @@
+name: Build and release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (recreated at the built commit if missing)"
+        required: true
+        default: v2.2.2-termux1
+        type: string
+      title:
+        description: "Release title"
+        required: false
+        default: "Heimdall 2.2.2 for Termux (aarch64)"
+        type: string
+      release_notes:
+        description: "Custom release notes; empty uses .github/release-notes-default.md"
+        required: false
+        default: ""
+        type: string
+      create_release:
+        description: "Create or update the GitHub release after building"
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark the release as a pre-release"
+        required: false
+        default: false
+        type: boolean
+      strip:
+        description: "Strip debug symbols from the binary"
+        required: false
+        default: true
+        type: boolean
+      base:
+        description: "Base commit for the heimdall-termux.patch diff"
+        required: false
+        default: 8f3044db985fd9710038f04886b51240ddbb2834
+        type: string
+      config_json:
+        description: 'Optional JSON overriding any input, e.g. {"tag": "v2.2.2-termux2", "prerelease": true}'
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build in Termux and release
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve configuration
+        id: cfg
+        env:
+          IN_TAG: ${{ inputs.tag }}
+          IN_TITLE: ${{ inputs.title }}
+          IN_NOTES: ${{ inputs.release_notes }}
+          IN_CREATE: ${{ inputs.create_release }}
+          IN_PRERELEASE: ${{ inputs.prerelease }}
+          IN_STRIP: ${{ inputs.strip }}
+          IN_BASE: ${{ inputs.base }}
+          IN_JSON: ${{ inputs.config_json }}
+        run: |
+          set -euo pipefail
+          defaults=$(jq -n \
+            --arg tag "$IN_TAG" \
+            --arg title "$IN_TITLE" \
+            --arg notes "$IN_NOTES" \
+            --argjson create "$IN_CREATE" \
+            --argjson prerelease "$IN_PRERELEASE" \
+            --argjson strip "$IN_STRIP" \
+            --arg base "$IN_BASE" \
+            '{tag: $tag, title: $title, notes: $notes, create_release: $create, prerelease: $prerelease, strip: $strip, base: $base}')
+          override='{}'
+          if [ -n "$IN_JSON" ]; then
+            override=$(printf '%s' "$IN_JSON" | jq -ce 'if type == "object" then . else error("config_json must be a JSON object") end')
+          fi
+          merged=$(printf '%s\n%s' "$defaults" "$override" | jq -sc '.[0] * .[1]')
+          {
+            echo "tag=$(jq -r '.tag' <<<"$merged")"
+            echo "title=$(jq -r '.title' <<<"$merged")"
+            echo "create=$(jq -r '.create_release' <<<"$merged")"
+            echo "prerelease=$(jq -r '.prerelease' <<<"$merged")"
+            echo "strip=$(jq -r '.strip' <<<"$merged")"
+            echo "base=$(jq -r '.base' <<<"$merged")"
+            echo "notes<<__NOTES_EOF__"
+            jq -r '.notes' <<<"$merged"
+            echo "__NOTES_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate patch file
+        env:
+          BASE: ${{ steps.cfg.outputs.base }}
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE}^{commit}" || { echo "base commit not found: $BASE" >&2; exit 1; }
+          mkdir -p dist
+          git diff "$BASE" HEAD > dist/heimdall-termux.patch
+          test -s dist/heimdall-termux.patch
+
+      - name: Prepare directories
+        run: mkdir -p build dist && chmod 777 build dist
+
+      - name: Build inside Termux container (aarch64)
+        env:
+          STRIP_ON: ${{ steps.cfg.outputs.strip }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 \
+            -e STRIP_ON="$STRIP_ON" \
+            -v "$PWD":/work -w /work \
+            termux/termux-docker:aarch64 \
+            bash -c '
+              set -euo pipefail
+              export PREFIX=/data/data/com.termux/files/usr
+              export HOME=/data/data/com.termux/files/home
+              export PATH="$PREFIX/bin:$PATH"
+              pkg update -y || { sleep 5; pkg update -y; }
+              bash termux/build.sh
+              if [ "$STRIP_ON" = "true" ]; then
+                strip --strip-all build/bin/heimdall
+              fi
+              cp build/bin/heimdall dist/heimdall-real
+              cp termux/heimdall dist/heimdall
+              chmod 700 dist/heimdall dist/heimdall-real
+              tar -C dist -czf dist/heimdall-termux-aarch64.tar.gz heimdall heimdall-real
+              (cd dist && sha256sum heimdall-termux-aarch64.tar.gz > SHA256SUMS)
+              cp install.sh dist/install.sh
+              chmod 700 dist/install.sh
+              echo "== Smoke test =="
+              ./dist/heimdall-real version
+              chmod a+rX dist/heimdall dist/heimdall-real dist/heimdall-termux-aarch64.tar.gz dist/SHA256SUMS dist/install.sh
+            '
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+
+      - name: Create release
+        if: steps.cfg.outputs.create == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.cfg.outputs.tag }}
+          TITLE: ${{ steps.cfg.outputs.title }}
+          NOTES: ${{ steps.cfg.outputs.notes }}
+          PRERELEASE: ${{ steps.cfg.outputs.prerelease }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          notes_file=$(mktemp)
+          if [ -n "$NOTES" ]; then
+            printf '%s\n' "$NOTES" > "$notes_file"
+          else
+            cp .github/release-notes-default.md "$notes_file"
+          fi
+          {
+            echo ""
+            echo "SHA256 (heimdall-termux-aarch64.tar.gz): $(cut -d' ' -f1 dist/SHA256SUMS)"
+            echo ""
+            echo "Built from: ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$notes_file"
+          assets=(dist/heimdall-termux-aarch64.tar.gz dist/SHA256SUMS dist/install.sh dist/heimdall-termux.patch)
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$REPO" --title "$TITLE" --notes-file "$notes_file" --prerelease="$PRERELEASE"
+            gh release upload "$TAG" --repo "$REPO" --clobber "${assets[@]}"
+          else
+            if git ls-remote --exit-code origin "refs/tags/$TAG" >/dev/null 2>&1; then
+              git push origin ":refs/tags/$TAG"
+            fi
+            extra=()
+            if [ "$PRERELEASE" = "true" ]; then extra+=(--prerelease); fi
+            gh release create "$TAG" --repo "$REPO" \
+              --title "$TITLE" --notes-file "$notes_file" \
+              --target "$GITHUB_SHA" "${extra[@]}" "${assets[@]}"
+          fi
+          echo "## Release published" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tag: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- run: ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}" >> "$GITHUB_STEP_SUMMARY"
