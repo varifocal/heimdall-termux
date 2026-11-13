@@ -3,6 +3,9 @@
 Heimdall 2.2.2, patched to run in Termux on non-rooted Android. Instead of
 scanning USB buses, it uses termux-usb to reach your device.
 
+<img width="800" height="500" alt="download" src="https://github.com/user-attachments/assets/4ebe509e-1e18-4a09-8bf3-25e652b6ab5a" />
+
+
 This repository is a fork of
 [Benjamin-Dobell/Heimdall](https://github.com/Benjamin-Dobell/Heimdall),
 stacked on top of
